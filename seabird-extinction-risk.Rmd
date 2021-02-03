@@ -57,7 +57,7 @@ library(PVR)
 
 #### trait data ####
 
-sb <- readr::read_csv("data/Appendix S3.csv", col_types = cols(
+sb <- readr::read_csv("data/Non-imputed Trait Data.csv", col_types = cols(
   binomial = col_character(),
   Order = col_character(),
   Family = col_character(),
@@ -398,7 +398,7 @@ traits$English <- sb1$English
 
 
 # Save traits file
-write.csv(traits, "Appendix S4 - Imputed Trait Data.csv")
+write.csv(traits, "Imputed Trait Data.csv")
 
 
 ## To identify how variable to 15 trait datasets are, we create a variance plot for each trait
