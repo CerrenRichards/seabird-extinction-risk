@@ -1,0 +1,1651 @@
+---
+title: "seabird-extinction-risk"
+author: "Cerren Richards"
+date: "03/02/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+## Contents
+
+1. Trait imputations
+2. Averaging the 15 trait datasets 
+3. Extracting IUCN categories
+4. Define species as globally and non-threatened
+5. Mixed data PCA
+    * Plot the PCA mixed data output
+    * Plot the PCA mixed data trait coordinates
+    * PERMANOVA
+6. Individual trait distributions
+    * Continuous Trait Distributions
+    * Categorical Trait Distributions
+    * Differences in globally threatened and non-threatened traits
+7. Unique trait combination (UTCs)
+    * Bin continuous traits to small, medium and large
+    * Calculate UTCs
+    * Make the UTC plots
+8. Importing IUCN threat data
+9. SIMPER analysis
+    * SIMPER table
+
+##______________________________________________________________
+## 1. Trait Imputations 
+##______________________________________________________________
+
+The R chunk below contains the method used to impute the missing trait data for 341 seabird species.
+
+``` {r, eval = FALSE}
+
+# Set up required packages #
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(dplyr, readr, ape, devtools, missForest, MPSEM, tidyr)
+
+# download and install PVR package from CRAN archive
+#devtools::install_version("PVR", version = "0.2.1")
+library(PVR)
+
+# devtools: package installation # calls: install_version
+# dplyr: data manipulation # calls: select 
+# readr: used to read csvs # calls: read_csv
+# ape: phylogenetic data # calls: read.tree
+# PVR: phylogenetic decomposition # calls: PVRdecomp
+# missForest: used to perform multiple imputation  # calls: missForest
+
+#### trait data ####
+
+sb <- readr::read_csv("data/Appendix S3.csv", col_types = cols(
+  binomial = col_character(),
+  Order = col_character(),
+  Family = col_character(),
+  family_english = col_character(),
+  English = col_character(),
+  clutch = col_double(),
+  body_mass_median = col_double(),
+  GL = col_double(),
+  hab_breadth = col_double(),
+  diet_5cat = col_factor(levels = c("Invertebrates", "Fish and Carrion", "Omnivore")),
+  foraging_guild = col_factor(levels = c("Diver", "Surface", "Generalist", "Ground")),
+  pelagic_specialist = col_factor(levels = c("Non-pelagic Specialist", "Pelagic Specialist")),
+  migrate = col_factor(levels = c("FM", "NM"))
+))
+
+summary(sb)
+
+sb_miss <- dplyr::select(sb, binomial, clutch:migrate) %>% 
+  as.data.frame()
+
+##### phylogenetic eigenvectors ####
+
+# read in birds tree - Prum et al., 2015 - A comprehensive phylogeny of birds (Aves) using targeted next-generation DNA sequencing
+birds_tree <- read.tree("data/BigBird.All.NewNames.7000Taxa.tre")
+
+# identify non-seabirds
+all_birds <- as.data.frame(birds_tree[[1]]$tip.label) %>% 
+  dplyr::rename(species = `birds_tree[[1]]$tip.label`) %>% 
+  dplyr::mutate_if(is.factor, as.character) %>%
+  # convert complex species names to binomials
+  dplyr::mutate(binomial = sapply(strsplit(.$species, "_"), FUN = function(y) {paste(y[3], y[4], sep = " ")})) %>% 
+  # remove seabirds
+  dplyr::anti_join(dplyr::select(sb, binomial), by = "binomial")
+
+# remove non-seabirds from tree
+seabirds_tree <- ape::drop.tip(birds_tree[[1]], all_birds$species) # 248 seabird species
+
+# convert phylogenetic tree to directed graph
+sb_t <- MPSEM::Phylo2DirectedGraph(seabirds_tree)
+
+# build a phylogenetic eigenvector map
+sb_pem <- MPSEM::PEM.build(sb_t)
+
+# extract phylogenetic eigenvectors
+sb_pem_df <- as.data.frame(sb_pem) %>% 
+  # convert rownames to explicit column
+  tibble::rownames_to_column(var = "species") %>% 
+  dplyr::mutate(binomial = sapply(strsplit(.$species, "_"), FUN = function(y) {paste(y[3], y[4], sep = " ")})) %>% 
+  dplyr::select(binomial, V_1:V_10) %>% 
+  dplyr::distinct(binomial, .keep_all = TRUE)
+
+sb_miss <- dplyr::left_join(sb_miss, sb_pem_df, by = "binomial") %>% 
+  tibble::column_to_rownames(var = "binomial")
+
+#### random forest imputation ####
+
+sb_imp <- replicate(15, missForest::missForest(sb_miss, maxiter = 20, ntree = 1000, variablewise = TRUE))
+
+sb_imp_dt <- sb_imp[seq(1, 30, 2)]
+
+sb_imp_dt <- lapply(1:15, function(x) {
+  tibble::rownames_to_column(sb_imp_dt[[x]], var = "binomial") %>% 
+    # add species metadata
+    dplyr::left_join(., dplyr::select_if(sb, is.character), by = "binomial") %>% 
+    # select columns needed (drop phylogenetic eigenvectors)
+    dplyr::select(binomial, Order:IUCN, clutch:migrate)
+})
+
+sb_imp_error <- sb_imp[seq(2, 30, 2)]
+
+sb_imp_error <- lapply(1:15, function(x) {
+  out <- sb_imp_error[[x]][1:8]
+})
+
+list_sb_imp <- list(sb_imp_dt, sb_imp_error)
+
+# save: list_sb_imp
+saveRDS(list_sb_imp, "data/list_sb_imp.rds")
+
+# Variance explained by phylogenetic eigenvectors
+
+# get code from this function (function no longer works - not updated)
+PVR::PVRdecomp
+
+pD <- cophenetic.phylo(seabirds_tree)
+A <- as.matrix(-0.5 * (pD))
+l <- matrix(1, nrow = nrow(pD), ncol = 1)
+L <- l %*% t(l)
+pD <- (diag(ncol(pD)) - ((1/ncol(pD)) * L)) %*% A %*% (diag(ncol(pD)) - 
+                                                           +                                                            ((1/ncol(pD)) * L))
+pvr <- (eigen(pD, symmetric = TRUE))
+Naxis <- ncol(pD) - sum((pvr$values <= 0) * 1)
+pvr$values <- pvr$values[1:Naxis]
+pvr$vectors <- pvr$vectors[, 1:Naxis]
+
+sum(pvr$values[1:10])/sum(pvr$values)*100
+
+# 61.19067%
+
+```
+
+
+
+
+##______________________________________________________________
+## 2. Averaging the 15 trait datasets
+##______________________________________________________________
+
+The imputations produce 15 datasets with traits that vary slightly between each dataset. We take the mean of all continuous traits and mode of catgorical traits to produce one dataset of traits. This dataset is used for all further analyses.
+
+```{r, eval = FALSE}
+library(dplyr);library(modeest)
+library(matrixStats)
+
+list.files()
+sb_341<- readRDS("list_sb_imp.rds") 
+
+sb1<- as.data.frame(sb_341[[1]][[1]])
+sb2<- as.data.frame(sb_341[[1]][[2]])
+sb3<- as.data.frame(sb_341[[1]][[3]])
+sb4<- as.data.frame(sb_341[[1]][[4]])
+sb5<- as.data.frame(sb_341[[1]][[5]])
+
+sb6<- as.data.frame(sb_341[[1]][[6]])
+sb7<- as.data.frame(sb_341[[1]][[7]])
+sb8<- as.data.frame(sb_341[[1]][[8]])
+sb9<- as.data.frame(sb_341[[1]][[9]])
+sb10<- as.data.frame(sb_341[[1]][[10]])
+
+sb11<- as.data.frame(sb_341[[1]][[11]])
+sb12<- as.data.frame(sb_341[[1]][[12]])
+sb13<- as.data.frame(sb_341[[1]][[13]])
+sb14<- as.data.frame(sb_341[[1]][[14]])
+sb15<- as.data.frame(sb_341[[1]][[15]])
+
+# Calculate the mean trait for all continuous data
+
+# Clutch Size
+clutch <- bind_rows(c(data.frame(sb1$clutch), 
+                      data.frame(sb2$clutch), 
+                      data.frame(sb3$clutch),
+                      data.frame(sb4$clutch),
+                      data.frame(sb5$clutch),
+                      data.frame(sb6$clutch),
+                      data.frame(sb7$clutch),
+                      data.frame(sb8$clutch),
+                      data.frame(sb9$clutch),
+                      data.frame(sb10$clutch),
+                      data.frame(sb11$clutch),
+                      data.frame(sb12$clutch),
+                      data.frame(sb13$clutch),
+                      data.frame(sb14$clutch),
+                      data.frame(sb15$clutch)))
+
+clutch$clutch<- rowMeans(clutch)
+clutch$var <- rowVars(as.matrix(clutch[,c(-16)]))
+clutch$trait <- "Clutch Size"
+
+
+# Body Mass
+body_mass_median <- bind_rows(c(data.frame(sb1$body_mass_median), 
+                      data.frame(sb2$body_mass_median), 
+                      data.frame(sb3$body_mass_median),
+                      data.frame(sb4$body_mass_median),
+                      data.frame(sb5$body_mass_median),
+                      data.frame(sb6$body_mass_median),
+                      data.frame(sb7$body_mass_median),
+                      data.frame(sb8$body_mass_median),
+                      data.frame(sb9$body_mass_median),
+                      data.frame(sb10$body_mass_median),
+                      data.frame(sb11$body_mass_median),
+                      data.frame(sb12$body_mass_median),
+                      data.frame(sb13$body_mass_median),
+                      data.frame(sb14$body_mass_median),
+                      data.frame(sb15$body_mass_median)))
+
+body_mass_median$body_mass_median<- rowMeans(body_mass_median)
+body_mass_median$var <- rowVars(as.matrix(body_mass_median[,c(-16)]))
+body_mass_median$trait <- "Body Mass"
+
+# Generation Length
+GL <- bind_rows(c(data.frame(sb1$GL), 
+                      data.frame(sb2$GL), 
+                      data.frame(sb3$GL),
+                      data.frame(sb4$GL),
+                      data.frame(sb5$GL),
+                      data.frame(sb6$GL),
+                      data.frame(sb7$GL),
+                      data.frame(sb8$GL),
+                      data.frame(sb9$GL),
+                      data.frame(sb10$GL),
+                      data.frame(sb11$GL),
+                      data.frame(sb12$GL),
+                      data.frame(sb13$GL),
+                      data.frame(sb14$GL),
+                      data.frame(sb15$GL)))
+
+GL$GL<- rowMeans(GL)
+GL$var <- rowVars(as.matrix(GL[,c(-16)]))
+GL$trait <- "Generation Length"
+
+
+# Habitat Breadth 
+hab_breadth <- bind_rows(c(data.frame(sb1$hab_breadth), 
+                      data.frame(sb2$hab_breadth), 
+                      data.frame(sb3$hab_breadth),
+                      data.frame(sb4$hab_breadth),
+                      data.frame(sb5$hab_breadth),
+                      data.frame(sb6$hab_breadth),
+                      data.frame(sb7$hab_breadth),
+                      data.frame(sb8$hab_breadth),
+                      data.frame(sb9$hab_breadth),
+                      data.frame(sb10$hab_breadth),
+                      data.frame(sb11$hab_breadth),
+                      data.frame(sb12$hab_breadth),
+                      data.frame(sb13$hab_breadth),
+                      data.frame(sb14$hab_breadth),
+                      data.frame(sb15$hab_breadth)))
+
+hab_breadth$hab_breadth<- rowMeans(hab_breadth)
+hab_breadth$var <- rowVars(as.matrix(hab_breadth[,c(-16)]))
+hab_breadth$trait <- "Habitat Breadth"
+
+# Calculate the mode trait for all categorical data
+
+
+# Diet Guild
+diet_5cat <- bind_rows(c(data.frame(sb1$diet_5cat), 
+                   data.frame(sb2$diet_5cat), 
+                   data.frame(sb3$diet_5cat),
+                   data.frame(sb4$diet_5cat),
+                   data.frame(sb5$diet_5cat),
+                   data.frame(sb6$diet_5cat),
+                   data.frame(sb7$diet_5cat),
+                   data.frame(sb8$diet_5cat),
+                   data.frame(sb9$diet_5cat),
+                   data.frame(sb10$diet_5cat),
+                   data.frame(sb11$diet_5cat),
+                   data.frame(sb12$diet_5cat),
+                   data.frame(sb13$diet_5cat),
+                   data.frame(sb14$diet_5cat),
+                   data.frame(sb15$diet_5cat)))
+
+diet_5cat$diet_5cat<- apply(diet_5cat[,1:length(diet_5cat)], 1, mfv)
+
+library(remotes)
+remotes::install_github("raredd/ragree")
+
+diet_5cat$var<- apply(diet_5cat[,1:15], 1, ragree::unalike)
+diet_5cat$trait <- "Diet Guild"
+
+
+
+# Migration
+migrate <- bind_rows(c(data.frame(sb1$migrate), 
+                   data.frame(sb2$migrate), 
+                   data.frame(sb3$migrate),
+                   data.frame(sb4$migrate),
+                   data.frame(sb5$migrate),
+                   data.frame(sb6$migrate),
+                   data.frame(sb7$migrate),
+                   data.frame(sb8$migrate),
+                   data.frame(sb9$migrate),
+                   data.frame(sb10$migrate),
+                   data.frame(sb11$migrate),
+                   data.frame(sb12$migrate),
+                   data.frame(sb13$migrate),
+                   data.frame(sb14$migrate),
+                   data.frame(sb15$migrate)))
+
+migrate$migrate<- apply(migrate[ ,1:length(migrate)], 1, mfv)
+migrate$var<- apply(migrate[,1:15], 1, ragree::unalike)
+migrate$trait <- "Migration Strategy"
+
+# Foraging Guild
+foraging_guild <- bind_rows(c(data.frame(sb1$foraging_guild), 
+                   data.frame(sb2$foraging_guild), 
+                   data.frame(sb3$foraging_guild),
+                   data.frame(sb4$foraging_guild),
+                   data.frame(sb5$foraging_guild),
+                   data.frame(sb6$foraging_guild),
+                   data.frame(sb7$foraging_guild),
+                   data.frame(sb8$foraging_guild),
+                   data.frame(sb9$foraging_guild),
+                   data.frame(sb10$foraging_guild),
+                   data.frame(sb11$foraging_guild),
+                   data.frame(sb12$foraging_guild),
+                   data.frame(sb13$foraging_guild),
+                   data.frame(sb14$foraging_guild),
+                   data.frame(sb15$foraging_guild)))
+
+foraging_guild$foraging_guild<- apply(foraging_guild[ ,1:length(foraging_guild)], 1, mfv)
+foraging_guild$var<- apply(foraging_guild[,1:15], 1, ragree::unalike)
+foraging_guild$trait <- "Foraging Guild"
+
+# Pelagic Specialism
+pelagic_specialist <- bind_rows(c(data.frame(sb1$pelagic_specialist), 
+                   data.frame(sb2$pelagic_specialist), 
+                   data.frame(sb3$pelagic_specialist),
+                   data.frame(sb4$pelagic_specialist),
+                   data.frame(sb5$pelagic_specialist),
+                   data.frame(sb6$pelagic_specialist),
+                   data.frame(sb7$pelagic_specialist),
+                   data.frame(sb8$pelagic_specialist),
+                   data.frame(sb9$pelagic_specialist),
+                   data.frame(sb10$pelagic_specialist),
+                   data.frame(sb11$pelagic_specialist),
+                   data.frame(sb12$pelagic_specialist),
+                   data.frame(sb13$pelagic_specialist),
+                   data.frame(sb14$pelagic_specialist),
+                   data.frame(sb15$pelagic_specialist)))
+
+pelagic_specialist$pelagic_specialist<- apply(pelagic_specialist[ ,1:length(pelagic_specialist)], 1, mfv)
+pelagic_specialist$var<- apply(pelagic_specialist[,1:15], 1, ragree::unalike)
+pelagic_specialist$trait <- "Pelagic Specialism"
+
+# Bind the mean and mode traits into one dataframe
+
+traits <- bind_rows(c(data.frame(clutch$clutch), 
+                   data.frame(body_mass_median$body_mass_median), 
+                   data.frame(GL$GL),
+                   data.frame(hab_breadth$hab_breadth),
+                   data.frame(pelagic_specialist$pelagic_specialist),
+                   data.frame(foraging_guild$foraging_guild),
+                   data.frame(migrate$migrate),
+                   data.frame(diet_5cat$diet_5cat)))
+
+colnames(traits) <- c("clutch", "body_mass_median", "GL", "hab_breadth", "pelagic_specialist", "foraging_guild", "migrate", "diet_5cat") 
+
+
+# add the binomial to the new trait dataframe
+traits$binomial <- sb1$binomial
+
+## add in the english names and family
+traits$Order <- sb1$Order
+traits$Family <- sb1$family_english
+traits$English <- sb1$English
+
+
+# Save traits file
+write.csv(traits, "Appendix S4 - Imputed Trait Data.csv")
+
+
+## To identify how variable to 15 trait datasets are, we create a variance plot for each trait
+variance <- bind_rows(select(clutch, var, trait), select(GL, var, trait),
+          select(hab_breadth, var, trait), select(body_mass_median, var, trait),
+          select(diet_5cat, var, trait), select(foraging_guild, var, trait),
+          select(pelagic_specialist, var, trait), select(migrate, var, trait))
+
+library(ggplot2)
+
+ggplot(variance, aes(x=var)) + geom_histogram(bins = 30)+
+  theme_bw(base_size = 15) + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())+
+  facet_wrap(~trait, ncol = 2)+
+  labs(x = "Variance", y = "Number of Species")
+
+  ggsave("Trait_Variance.png", width = 8, height = 6)
+
+  
+```
+
+
+
+
+##______________________________________________________________
+## 3. Extracting the IUCN categories for each species
+##______________________________________________________________
+
+Here we extract the IUCN categories from the IUCN Red List database.
+
+You will need a unique IUCN API code to run this code.
+
+We select the most recent IUCN categories for our analyses. The most up-to-date categories are from 2019 or earlier.
+
+```{r, eval = FALSE}
+
+library(rredlist); library(rlist) # Load packages
+
+# There are 17 species in the trait dataset that have different names in the IUCN database, therefore we must change the names before extracting the threat data
+
+traits$binomial<- as.character(traits$binomial) ## Make data as character
+traits$binomial[traits$binomial == "Procelsterna albivitta"] <- "Anous albivittus"
+traits$binomial[traits$binomial == "Phalacrocorax urile"] <- "Urile urile"
+traits$binomial[traits$binomial == "Phalacrocorax ranfurlyi"] <- "Leucocarbo ranfurlyi"
+traits$binomial[traits$binomial == "Phalacrocorax penicillatus"] <- "Urile penicillatus"
+traits$binomial[traits$binomial == "Phalacrocorax pelagicus"] <- "Urile pelagicus"
+traits$binomial[traits$binomial == "Phalacrocorax onslowi"] <- "Leucocarbo onslowi"
+traits$binomial[traits$binomial == "Phalacrocorax magellanicus"] <- "Leucocarbo magellanicus"
+traits$binomial[traits$binomial == "Phalacrocorax harrisi"] <- "Nannopterum harrisi"
+traits$binomial[traits$binomial == "Phalacrocorax gaimardi"] <- "Poikilocarbo gaimardi"
+traits$binomial[traits$binomial == "Phalacrocorax colensoi"] <- "Leucocarbo colensoi"
+traits$binomial[traits$binomial == "Phalacrocorax chalconotus"] <- "Leucocarbo chalconotus"
+traits$binomial[traits$binomial == "Phalacrocorax carunculatus"] <- "Leucocarbo carunculatus"
+traits$binomial[traits$binomial == "Phalacrocorax campbelli"] <- "Leucocarbo campbelli"
+traits$binomial[traits$binomial == "Phalacrocorax brasilianus"] <- "Nannopterum brasilianus"
+traits$binomial[traits$binomial == "Phalacrocorax auritus"] <- "Nannopterum auritus"
+traits$binomial[traits$binomial == "Phalacrocorax atriceps"] <- "Leucocarbo atriceps"
+traits$binomial[traits$binomial == "Phalacrocorax aristotelis"] <- "Gulosus aristotelis"
+traits$binomial[traits$binomial == "Procelsterna cerulea"] <- "Anous ceruleus"
+
+spp <- traits$binomial # vector of species names from the traits dataframe
+
+iucn_key <- "" # Enter your unique IUCN code here
+
+# Extract the IUCN categories for each species from the IUCN database. 
+# NOTE - this code can take ~15 minutes to run.
+
+iucn <- lapply(spp, function(x) {
+  y <- rl_history(name = x, key = iucn_key)
+  Sys.sleep(2)
+  # 2 second delay makes API work better - recommended by IUCN
+  return(y)
+})
+
+### Add an extra column to the dataframes in the list with the binomial names:
+for (i in 1:length(iucn)) { 
+  iucn[[i]][["result"]]$binomial <- iucn[[i]][["name"]] 
+}
+
+# Thayer's Gull is Not Evaluated by the IUCN, so we will remove it
+iucn <- iucn[sapply(iucn, length)>1] 
+
+# binds all list elements by row to make a dataframe
+iucn <- list.rbind(iucn) 
+
+iucn[1:341] <- NULL # remove all of the extra species names in the list
+
+iucn[[134]] <- NULL # deletes Thayer's Gull
+
+# binds all list elements by row to make a dataframe
+iucn <- list.rbind(iucn) 
+
+# remove all the historic information and only keep the most recent IUCN classification 
+iucn <- iucn %>% distinct(binomial, .keep_all = TRUE)
+
+
+# Delete the columns that will not be used in further analyses
+iucn <- iucn[- c(1,3)] 
+
+# Rename the code column to IUCN
+traits <- left_join(traits, iucn, by = "binomial")
+
+# rename the column
+colnames(traits)[colnames(traits) == 'code'] <- 'IUCN'
+
+```
+
+
+
+
+##______________________________________________________________
+## 4. Define species as globally threatened and non-threatened
+##______________________________________________________________
+
+```{r, eval = FALSE}
+
+
+# Rename the IUCN categories as globally and non-threatened
+traits$Threat <- as.character(traits$IUCN)
+
+# GT = GLOBALLY THREATENED
+# NT = NON-THREATENED
+traits$Threat[traits$Threat == "CR"] <- "GT" 
+traits$Threat[traits$Threat == "EN"] <- "GT"
+traits$Threat[traits$Threat == "VU"] <- "GT"
+traits$Threat[traits$Threat == "LC"] <- "NT"
+traits$Threat[traits$Threat == "NT"] <- "NT"
+
+# Remove Data Difficient species 
+traits <- traits[!(traits$Threat=="DD"),]
+
+# Remove Thayer's Gull
+traits <- traits[!(traits$binomial=="Larus thayeri"),]
+
+
+```
+
+
+##______________________________________________________________
+## 5. Mixed Data PCA
+##______________________________________________________________
+
+The following code runs the mixed data PCA for continuous and categorical traits. 
+
+```{r message=FALSE, error=FALSE, warning=FALSE, eval = FALSE}
+
+
+library(PCAmixdata); library(dplyr) #load packages
+
+# Split the traits into continuous and categorical
+continuous <- traits %>% select(GL, body_mass_median, hab_breadth, clutch)
+categorical <- traits %>% select(diet_5cat, migrate, pelagic_specialist, foraging_guild)
+
+# Run the mixed PCA
+traits.pcamix <- PCAmix(X.quanti=continuous, X.quali=categorical, rename.level=TRUE, graph=T)
+
+# To obtain the variance of the principal components:
+traits.pcamix$eig
+
+```
+
+#### Quanitfy the 95% Kernel
+```{r}
+library(ks)
+
+# Make a new dataframe by extracting the PCA coordinates from PCAmix list
+pca.plot <- as.data.frame(traits.pcamix[["ind"]][["coord"]])
+pca.plot$Threat<- traits$Threat
+
+# kernel density estimation
+# extract first two principal components
+GT <- pca.plot %>% select(`dim 1`, `dim 2`, Threat)
+
+# Subset the globally threatened (GT) and non-threatened (NT) coordinates
+NT <- GT %>% filter(Threat== "NT") %>% select(`dim 1`, `dim 2`)
+GT <- GT %>% filter(Threat== "GT") %>% select(`dim 1`, `dim 2`)
+
+## GT 95% Kernel
+kd_GT <- kde(GT, compute.cont=TRUE)
+GT_contour_95 <- with(kd_GT, contourLines(x=eval.points[[1]], y=eval.points[[2]],
+                                    z=estimate, levels=cont["5%"])[[1]])
+GT_contour_95 <- data.frame(GT_contour_95)
+GT_contour_95$Threat <- "GT"
+
+
+## NT 95% Kernel
+kd_NT <- kde(NT, compute.cont=TRUE)
+NT_contour_95 <- with(kd_NT, contourLines(x=eval.points[[1]], y=eval.points[[2]],
+                                    z=estimate, levels=cont["5%"])[[1]])
+NT_contour_95 <- data.frame(NT_contour_95)
+NT_contour_95$Threat <- "NT"
+
+
+## GT 99% Kernel
+GT_contour_99 <- with(kd_GT, contourLines(x=eval.points[[1]], y=eval.points[[2]],
+                                    z=estimate, levels=cont["1%"])[[1]])
+GT_contour_99 <- data.frame(GT_contour_99)
+GT_contour_99$Threat <- "GT"
+
+
+## NT 99% Kernel
+NT_contour_99 <- with(kd_NT, contourLines(x=eval.points[[1]], y=eval.points[[2]],
+                                    z=estimate, levels=cont["1%"])[[1]])
+NT_contour_99 <- data.frame(NT_contour_99)
+NT_contour_99$Threat <- "NT"
+
+```
+
+
+
+##______________________________________________________________
+#### *Plot the PCA mixed data output*
+##______________________________________________________________
+
+The following code plots the mixed data PCA biplot of seabird traits. This figure was edited further to add silhouettes and labels.  
+
+```{r message=FALSE, error=FALSE, warning=FALSE, eval = FALSE}
+
+library(ggplot2) #load  package 
+
+# Make a new dataframe by extracting the PCA coordinates from PCAmix list
+pca.plot <- as.data.frame(traits.pcamix[["ind"]][["coord"]])
+
+# Assign columns from the traits dataframe to the new pca.plot dataframe
+pca.plot$IUCN<- traits$IUCN
+pca.plot$Threat<- traits$Threat
+pca.plot$Order<- traits$Order
+pca.plot$Family<- traits$family_english
+pca.plot$English<- traits$English
+
+# Plot the PCA biplot using ggplot
+PCA <- ggplot(pca.plot, aes(x = `dim 1`, y = `dim 2`, col= Threat)) +
+  geom_point(alpha = 0.6, size = 6)+
+  scale_x_continuous(name="Dim1 (26.8%)", limits=c(-5, 5)) +
+  scale_y_continuous(name="Dim2 (14.4%)", limits=c(-5, 5))+
+  theme_bw() + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())+
+  theme(text = element_text(size = 20), legend.position=c(0.25, 0.12),
+        legend.text=element_text(size=15))+
+  scale_color_manual(name="", 
+                     labels = c("Globally Threatened", 
+                                "Non-threatened"), 
+                     values = c("GT"="dodgerblue", 
+                                "NT"="orange"))+
+  theme(axis.title.y = element_text(vjust = 2))+ # increase distance from the y-axis
+    theme(axis.title.x = element_text(vjust = -0.75))+ # increase distance from the x-axis
+  geom_path(aes(x, y), data=GT_contour_95)+
+  geom_path(aes(x, y), data=NT_contour_95)
+
+ 
+```
+
+
+##______________________________________________________________
+#### *Plot the PCA mixed data trait coordinates*
+##______________________________________________________________
+
+The following code is used to plot the mixed data PCA trait coordinates. This figure assists with the interpretation of the PCA biplot.
+
+```{r message=FALSE, error=FALSE, warning=FALSE, eval = FALSE}
+
+# To get the continuous and categorical coordinates for the PCA continuous traits
+continuous_coordinates <- as.data.frame(traits.pcamix
+                                        [["quanti"]][["coord"]])
+categorical_coordinates <- as.data.frame(traits.pcamix
+                                         [["levels"]][["coord"]])
+
+# Remame rows 
+rownames(continuous_coordinates)<- c("Generation Length", "Body Mass", 
+                                     "Habitat Breadth", "Clutch") 
+
+
+rownames(categorical_coordinates)<- c("Invertebrate", "Omnivore", 
+                                      "Vertebrate & Scavenger", "Full Migrant", 
+                                      "Non-migrant", 
+                                      "Non-Pelagic Specialist", 
+                                      "Pelagic Specialist", 
+                                      "Diver", "Generalist", 
+                                      "Ground", "Surface") 
+
+
+
+# Rescale the coordinates to the same scale as the mixed data PCA 
+continuous_coordinates$`dim 1`<- (continuous_coordinates$`dim 1`)*5.5
+continuous_coordinates$`dim 2`<- (continuous_coordinates$`dim 2`)*5.5
+categorical_coordinates$`dim 1`<- (categorical_coordinates$`dim 1`)*3
+categorical_coordinates$`dim 2`<- (categorical_coordinates$`dim 2`)*3
+
+categorical_coordinates$trait <- rownames(categorical_coordinates)
+continuous_coordinates$trait <- rownames(continuous_coordinates)
+
+library(ggrepel)
+
+
+## Continuous
+cont<- ggplot(continuous_coordinates, aes(x = `dim 1`, y = `dim 2`, label = trait)) +
+  theme_bw() + 
+      geom_vline(xintercept=c(0), linetype="dashed", colour = "grey")+
+      geom_hline(yintercept=c(0), linetype="dashed", colour = "grey")+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())+
+  geom_segment(size = 0.75, data = continuous_coordinates, 
+               aes(x = 0, y = 0, xend = `dim 1`, yend = `dim 2`), 
+               arrow = arrow(length = unit(0.2, "cm")), colour = "black")+
+      scale_x_continuous(name="", limits=c(-5, 5.1)) +
+  scale_y_continuous(name="", limits=c(-5, 5.1))+ # increase distance from the y-axis
+    theme(axis.title.x = element_text(vjust = -0.75))+
+      theme(text = element_text(size = 20))+
+   geom_text(data = subset(continuous_coordinates, `dim 2` > 0 & `dim 1` > 0),
+           nudge_y = 0.75)+
+    geom_text(data = subset(continuous_coordinates, `dim 2` < 0),
+           nudge_y = -0.75)+
+   geom_text(data = subset(continuous_coordinates, `dim 1` < 0),
+           nudge_x = 0.75,
+           nudge_y = 0.75)
+  
+
+
+## Catagorical
+cat <-ggplot(categorical_coordinates, aes(x = `dim 1`, y = `dim 2`, label = trait)) +
+  theme_bw() + 
+      geom_vline(xintercept=c(0), linetype="dashed", colour = "grey")+
+  geom_hline(yintercept=c(0), linetype="dashed", colour = "grey")+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())+
+        geom_point(size = 2)+
+    scale_x_continuous(name="Dim1 (26.8%)", limits=c(-5, 5.1)) +
+  scale_y_continuous(name="", limits=c(-5, 5.1)) +
+    theme(text = element_text(size = 20))+
+  theme(axis.title.y = element_text(vjust = 3))+ # increase distance from the y-axis
+    theme(axis.title.x = element_text(vjust = -0.75))+
+    geom_text_repel(data = subset(categorical_coordinates, trait == "Pelagic Specialist"), label = "Pelagic",
+           nudge_y = -1)+
+    geom_text_repel(data = subset(categorical_coordinates, trait == "Non-migrant"),
+           nudge_y = -1)+
+    geom_text_repel(data = subset(categorical_coordinates, trait == "Diver"),
+           nudge_y = 0.75)+
+    geom_text_repel(data = subset(categorical_coordinates, trait == "Omnivore"),
+           nudge_y = -0.75)+
+    geom_text_repel(data = subset(categorical_coordinates, trait == "Ground"),
+           nudge_y = 0.75)+
+    geom_text_repel(data = subset(categorical_coordinates, trait == "Invertebrate"),
+           nudge_y = -1,
+           nudge_x = -1)+
+      geom_text_repel(data = subset(categorical_coordinates, trait == "Vertebrate & Scavenger"), label = "Vert & Scav",
+                 nudge_y = 0.8,
+           nudge_x = 2.5)+
+  geom_text_repel(data = subset(categorical_coordinates, trait == "Surface"),
+           nudge_y = 1)+
+  geom_text_repel(data = subset(categorical_coordinates, trait == "Full Migrant"),
+           nudge_y = 1.5)+
+  geom_text_repel(data = subset(categorical_coordinates, trait == "Generalist"),
+           nudge_y = 0.75)+
+    geom_text_repel(data = subset(categorical_coordinates, trait == "Non-Pelagic Specialist"), label = "Non-pelagic",
+           nudge_y = -1)
+
+
+# Create a panel plot of all the figures
+library(patchwork)
+
+(PCA + labs(tag = 'a')| ((cont+ labs(tag = 'b')) / (cat +labs(tag = 'c'))))+ plot_layout(widths=c(2,1))
+
+# save
+ggsave("Figure1-OCT9.png", width = 300, height = 200, unit = "mm", dpi = 600)
+ggsave("Figure1.pdf", width = 300, height = 200, unit = "mm", dpi = 600)
+
+
+```
+
+
+```{r, echo=FALSE, warning=FALSE}
+library(knitr)
+include_graphics("Figure1.png")
+
+```
+
+Figure 1 Mixed data PCA biplot of seabird traits. a) Points are the principal component scores of each seabird (mean values across 15 imputed datasets). Ellipses indicate the 95% confidence intervals for globally threatened (blue) and non-threatened (orange) seabird species. Silhouettes represent a selection of families aggregated at the edge of trait space. Coordinates of b) continuous and c) categorical traits. Coordinates were rescaled to match the mixed data PCA.
+
+##______________________________________________________________
+## *PERMANOVA*
+##______________________________________________________________
+
+To quantify the degree to which threat status explains trait space variations amoung seabirds, we use the permutational MANOVA framework in the adonis function and package "vegan".
+
+```{r, message=FALSE, error=FALSE, warning=FALSE, eval = FALSE}
+
+library(vegan)
+
+pca_permanova <- pca.plot [,1:2] ## subset PCA1 and PCA2 
+
+adonis(pca_permanova ~ traits$Threat, method='euclidean') ## run the PerMANOVA with euclidean distance
+
+
+```
+
+
+
+##______________________________________________________________
+## 6. Individual Trait Distributions 
+##______________________________________________________________
+
+Here we plot the distributions for each trait using ggplot2. 
+
+#### *Continuous Trait Distributions*
+
+```{r message=FALSE, error=FALSE, warning=FALSE, eval = FALSE}
+library(ggpubr)
+
+# Split the species traits into globally threatened (CR_EN_VU) and non-threatened (LC_NT) based on their IUCN categories
+CR_EN_VU <- traits[traits$IUCN %in% c("CR", "EN", "VU"), ]
+LC_NT <- traits[traits$IUCN %in% c("LC", "NT"), ]
+
+traits$type <- "Habitat Breadth"
+
+# Habitat Breadth
+hab <- ggplot(traits, aes(x = hab_breadth))+ 
+  theme_bw(base_size = 25)+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  geom_density(data= LC_NT, linetype = "solid", colour = "orange",fill= "orange", alpha= 0.5, size = 1) +
+  geom_density(data= CR_EN_VU, linetype = "solid", colour = "#0073C2FF", fill= "#0073C2FF", alpha= 0.5, size = 1)+
+  scale_y_continuous(expand = c(0,0), limits = c(0, 1.5), breaks=seq(0, 1.5, 0.5)) +
+  scale_x_continuous(expand = c(0,0),limits = c(0.5, 5.5)) +
+  labs(x = "Habitat Breadth", y = "Density") +
+  geom_vline(data= CR_EN_VU,aes(xintercept = mean(hab_breadth)), linetype = "dashed", size = 1.3, colour = "#0073C2FF")+
+  geom_vline(data= LC_NT,aes(xintercept = mean(hab_breadth)), linetype = "dashed", size = 1.3, colour = "orange")+
+       facet_wrap(~type)+
+    theme(strip.text.x = element_text(size = 25, color = "white"), 
+          strip.background = element_rect(fill="black"))
+
+
+
+traits$type <- "Clutch Size"
+
+# Clutch
+clutch <- ggplot(traits, aes(x = clutch))+ 
+  theme_bw(base_size = 25)+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  geom_density(data= LC_NT, linetype = "solid", colour = "orange",fill= "orange", alpha= 0.5, size = 1) +
+  geom_density(data= CR_EN_VU, linetype = "solid", colour = "#0073C2FF", fill= "#0073C2FF", alpha= 0.5, size = 1)+
+  scale_y_continuous(expand = c(0,0), limits = c(0, 1.2), breaks=seq(0, 1.2, 0.4)) +
+  scale_x_continuous(expand = c(0,0),limits = c(0, 5)) +
+  labs(x = "Clutch Size", y = "") +
+  geom_vline(data= CR_EN_VU,aes(xintercept = mean(clutch)), linetype = "dashed", size = 1.3, colour = "#0073C2FF")+
+  geom_vline(data= LC_NT,aes(xintercept = mean(clutch)), linetype = "dashed", size = 1.3, colour = "orange")+
+       facet_wrap(~type)+
+    theme(strip.text.x = element_text(size = 25, color = "white"), 
+          strip.background = element_rect(fill="black"))
+
+traits$type <- "Generation Length"
+
+# Generation Length
+gen<- ggplot(traits, aes(x = GL))+ 
+  theme_bw(base_size = 25)+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  geom_density(data= LC_NT, linetype = "solid", colour = "orange",fill= "orange", alpha= 0.5, size = 1) +
+  geom_density(data= CR_EN_VU, linetype = "solid", colour = "#0073C2FF", fill= "#0073C2FF", alpha= 0.5, size = 1)+
+  scale_y_continuous(expand = c(0,0), limits = c(0, 4), breaks=seq(0, 4, 1)) +
+  scale_x_continuous(expand = c(0,0),limits = c(0.5, 1.8), breaks=seq(0.5, 1.75, 0.5)) +
+  labs(x = "Generation Length", y = "") +
+  geom_vline(data= CR_EN_VU,aes(xintercept = mean(GL)), linetype = "dashed", size = 1.3, colour = "#0073C2FF")+
+  geom_vline(data= LC_NT,aes(xintercept = mean(GL)), linetype = "dashed", size = 1.3, colour = "orange")+
+     facet_wrap(~type)+
+    theme(strip.text.x = element_text(size = 25, color = "white"), 
+          strip.background = element_rect(fill="black"))
+
+traits$type <- "Body Mass"
+
+# Body Mass
+body <- ggplot(traits, aes(x = body_mass_median))+ 
+  theme_bw(base_size = 25)+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  geom_density(data= LC_NT, linetype = "solid", colour = "orange",fill= "orange", alpha= 0.5, size = 1) +
+  geom_density(data= CR_EN_VU, linetype = "solid", colour = "#0073C2FF", fill= "#0073C2FF", alpha= 0.5, size = 1)+
+  scale_y_continuous(expand = c(0,0), limits = c(0, 0.8), breaks=seq(0, 0.8, 0.2)) +
+  scale_x_continuous(expand = c(0,0),limits = c(0.5, 5)) +
+  labs(x = "Body Mass", y = "") +
+  geom_vline(data= CR_EN_VU,aes(xintercept = mean(body_mass_median)), linetype = "dashed", size = 1.3, colour = "#0073C2FF")+
+  geom_vline(data= LC_NT,aes(xintercept = mean(body_mass_median)), linetype = "dashed", size = 1.3, colour = "orange")+
+  theme(legend.position = "bottom")+
+   facet_wrap(~type)+
+    theme(strip.text.x = element_text(size = 25, color = "white"), 
+          strip.background = element_rect(fill="black"))
+
+traits$type <- NULL
+
+
+```
+
+
+##______________________________________________________________
+#### *Categorical Trait Stacked Bar Chats* 
+##______________________________________________________________
+
+
+```{r message=FALSE, error=FALSE, warning=FALSE, eval = FALSE}
+
+library(scales) # Load package
+
+
+# Migration
+mg1<-count(traits, traits$migrate) 
+mg2<-count(LC_NT, LC_NT$migrate)
+mg3<-count(CR_EN_VU, CR_EN_VU$migrate)
+
+mg1$percentage<- mg1$n/sum(mg1$n)*100
+mg2$percentage<- mg2$n/sum(mg2$n)*100
+mg3$percentage<- mg3$n/sum(mg3$n)*100
+
+mg1<- mg1 %>% rename(migrate = 'traits$migrate')
+mg2<- mg2 %>% rename(migrate = 'LC_NT$migrate')
+mg3<- mg3 %>% rename(migrate = 'CR_EN_VU$migrate')
+
+mg<-rbind(mg2, mg3)
+
+
+mg$status<-c("Non-  threatened","Non-  threatened","Globally Threatened","Globally Threatened")
+mg$migrate<- c("Full Migrant","Non-migrant","Full Migrant","Non-migrant")
+
+mg$status = factor(mg$status, levels=c("Non-  threatened", "Globally Threatened"))
+mg$type <- "Migration"
+
+migration<- ggplot() + 
+  geom_bar(aes(y = percentage, x = status, fill = migrate, colour = status),  size = 1, data = mg, stat="identity")+
+  theme_bw(base_size = 25) +
+  scale_color_manual(values = c("orange", "#0073C2FF")) +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())+
+  labs(x = "", y = "Percentage")+ 
+  scale_fill_brewer(palette = "Greys") +
+  scale_x_discrete(labels = wrap_format(10))+
+    guides(color = FALSE, fill = guide_legend(nrow = 2))+
+  theme(legend.position = "bottom", legend.title = element_blank(),
+        legend.margin=margin(0,0,0,0),
+        legend.box.margin=margin(-10,-10,-10,-10))+
+  facet_wrap(~type)+
+    theme(strip.text.x = element_text(size = 25, color = "white"), 
+          strip.background = element_rect(fill="black"))
+
+
+# Foraging Guild
+
+fg1<-count(traits, foraging_guild)
+fg2<-count(LC_NT, foraging_guild)
+fg3<-count(CR_EN_VU, foraging_guild)
+
+fg1$percentage<- fg1$n/sum(fg1$n)*100
+fg2$percentage<- fg2$n/sum(fg2$n)*100
+fg3$percentage<- fg3$n/sum(fg3$n)*100
+fg<-rbind(fg2, fg3)
+
+fg$status<-c("Non-  threatened","Non-  threatened","Non-  threatened","Non-  threatened","Globally Threatened","Globally Threatened","Globally Threatened","Globally Threatened")
+
+fg$status = factor(fg$status, levels=c("Non-  threatened", "Globally Threatened"))
+fg$type <- "Foraging Guild"
+
+forage<- ggplot() + 
+  geom_bar(aes(y = percentage, x = status, fill = foraging_guild, colour = status),  size = 1, data = fg, stat="identity")+
+  theme_bw(base_size = 25) +
+  scale_color_manual(values = c("orange", "#0073C2FF")) +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())+
+  labs(x = "", y = "")+ 
+  scale_fill_brewer(palette = "Greys") +
+  scale_x_discrete(labels = wrap_format(10))+
+    guides(color = FALSE, fill = guide_legend(nrow = 2))+
+  theme(legend.position = "bottom", legend.title = element_blank(),
+        legend.margin=margin(0,0,0,0),
+        legend.box.margin=margin(-10,-10,-10,-10))+
+  facet_wrap(~type)+
+    theme(strip.text.x = element_text(size = 25, color = "white"), 
+          strip.background = element_rect(fill="black"))
+
+# Pelagic Specialist
+
+ps1<-count(traits, pelagic_specialist)
+ps2<-count(LC_NT, pelagic_specialist)
+ps3<-count(CR_EN_VU, pelagic_specialist)
+
+ps1$percentage<- ps1$n/sum(ps1$n)*100
+ps2$percentage<- ps2$n/sum(ps2$n)*100
+ps3$percentage<- ps3$n/sum(ps3$n)*100
+ps<-rbind(ps2, ps3)
+
+ps$status<-as.factor(c("Non-  threatened","Non-  threatened","Globally Threatened","Globally Threatened"))
+ps$status = factor(ps$status, levels=c("Non-  threatened","Globally Threatened"))
+ps$pelagic_specialist<- c("Non-pelagic", "Pelagic","Non-pelagic", "Pelagic")
+
+ps$type <- "Pelagic Specialism"
+  
+  
+pelagic <-  ggplot() + 
+  geom_bar(aes(y = percentage, x = status, fill = pelagic_specialist, colour = status), size = 1, data = ps, stat="identity")+
+  theme_bw(base_size = 25) +
+  scale_color_manual(values = c("orange", "#0073C2FF")) +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())+
+  labs(x = "", y = "")+ 
+  scale_fill_brewer(palette = "Greys") +
+  scale_x_discrete(labels = wrap_format(10))+
+    guides(color = FALSE, fill = guide_legend(nrow = 2))+
+  theme(legend.position = "bottom",
+        legend.title = element_blank(), 
+        legend.margin=margin(0,0,0,0),
+        legend.box.margin=margin(-10,-10,-10,-10))+
+  facet_wrap(~type)+
+    theme(strip.text.x = element_text(size = 25, color = "white"), 
+          strip.background = element_rect(fill="black"))
+  
+
+
+# Diet
+
+dt1<-count(traits, traits$diet_5cat)
+dt2<-count(LC_NT, diet_5cat)
+dt3<-count(CR_EN_VU, diet_5cat)
+
+dt1$percentage<- dt1$n/sum(dt1$n)*100
+dt2$percentage<- dt2$n/sum(dt2$n)*100
+dt3$percentage<- dt3$n/sum(dt3$n)*100
+dt<-rbind(dt2, dt3)
+
+dt$status<-c("Non-  threatened", "Non-  threatened","Non-  threatened","Globally Threatened","Globally Threatened","Globally Threatened")
+dt$diet_5cat<- c("Vert & Scav", "Invertebrate", "Omnivore", "Vert & Scav", "Invertebrate", "Omnivore")
+
+dt$status = factor(dt$status, levels=c("Non-  threatened", "Globally Threatened"))
+
+dt$type <- "Diet Guild"
+
+diet <- ggplot() + 
+  geom_bar(aes(y = percentage, x = status, fill = diet_5cat, colour = status), size = 1, data = dt, stat="identity")+
+  scale_color_manual(values = c("orange", "#0073C2FF")) +
+  theme_bw(base_size = 25) +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())+
+  labs(x = "", y = "")+ 
+  scale_fill_brewer(palette = "Greys") +
+  scale_x_discrete(labels = wrap_format(10))+
+    guides(color = FALSE, fill = guide_legend(nrow = 2))+
+  theme(legend.position = "bottom", legend.title = element_blank(),
+        legend.margin=margin(0,0,0,0),
+        legend.box.margin=margin(-10,-10,-10,-10))+
+    facet_wrap(~type)+
+    theme(strip.text.x = element_text(size = 25, color = "white"), 
+          strip.background = element_rect(fill="black"))
+
+
+# Create a plot with two rows and two columns
+
+library(patchwork)
+
+  (hab | clutch | gen | body) / (migration | forage | pelagic | diet)
+  
+  
+  ggsave("Figure2.pdf", width = 20, height = 10)
+  ggsave("Figure2 test.png", width = 20, height = 10)
+
+
+```
+
+
+```{r, echo=FALSE, warning=FALSE}
+library(knitr)
+include_graphics("Figure2.png")
+
+```
+
+
+Figure 2 Distributions of continuous traits and proportion of categorical traits. Orange represents non-threatened species, while blue represents globally threatened species.
+
+
+##______________________________________________________________
+#### *Differences in globally and non-threatened traits*
+##______________________________________________________________
+
+To test whether the traits of globally threatened and non-threatened seabirds are different at the individual trait level, we explore the distributions of continuous traits and proportions of categorical traits per threat category. Differences in the means of threatened and non-threatened species within continuous traits were compared with Mann-Whitney U tests using function wilcox.test (R Core Team, 2018). We further calculate Hedge’s g effect size with function hedges_g and package ‘effectsize’ (Ben-Shachar, Makowski & Lüdecke, 2020). For categorical traits, we test for independence with a Chi-squared approach using function chisq.test (R Core Team, 2018). 
+
+```{r message=FALSE, error=FALSE, warning=FALSE, eval = FALSE}
+library(effectsize)
+
+# create two dataframes for globally threatened (GT) and non-threatened (NT) traits
+GT <- traits[traits$Threat %in% c("GT"), ]
+NT <- traits[traits$Threat %in% c("NT"), ]
+
+# Continuous traits: Independent 2-group Mann-Whitney U Test
+
+# Body Mass
+wilcox.test(GT$body_mass_median,NT$body_mass_median) 
+hedges_g(body_mass_median ~ Threat , data = traits)
+
+# Habitat Breadth
+wilcox.test(GT$hab_breadth,NT$hab_breadth) 
+hedges_g(hab_breadth ~ Threat , data = traits)
+
+# Generation Length
+wilcox.test(GT$GL,NT$GL)
+hedges_g(GL ~ Threat , data = traits)
+
+# Clutch
+wilcox.test(GT$clutch,NT$clutch)
+hedges_g(clutch ~ Threat , data = traits)
+
+# Categorical traits: Chi-squared test for independence
+
+# Diet
+diet <- table(traits$Threat, traits$diet_5cat)
+chisq.test(diet)
+
+# Migration
+migration <- table(traits$Threat, traits$migrate)
+chisq.test(migration)
+
+# Pelagic Specialism
+pelagic <- table(traits$Threat, traits$pelagic_specialist)
+chisq.test(pelagic)
+
+# Foraging Guild
+foraging <- table(traits$Threat, traits$foraging_guild)
+chisq.test(foraging)
+
+
+# Percentage difference between globally threatened and non-threatened for each trait
+
+# Pelagic Specialists
+ps3$percentage - ps2$percentage # 18.8%
+
+# Foraging Guild
+fg3$percentage - fg2$percentage
+
+# Diet Guild
+dt3$percentage - dt2$percentage
+
+# migratoon
+mg3$percentage - mg2$percentage
+
+```
+
+
+##______________________________________________________________
+## 7. Unique Trait Combinations (UTCs)
+##______________________________________________________________
+
+The following code is used to calculate the UTCs for each IUCN threat category. 
+
+#### *Bin continuous traits to small, medium and large* 
+
+```{r message=FALSE, error=FALSE, warning=FALSE, eval = FALSE}
+library(mltools) # Load package
+
+#Bin traits into three bins that are equally spaced from min to max
+
+# Body Mass
+traits$bm_bin <- bin_data(traits$body_mass_median, bins=3, binType = "explicit")
+traits$bm_bin <- as.character(traits$bm_bin)
+traits$bm_bin[traits$bm_bin == "[1.403549454, 2.43586840766667)"] <- "BM_small"
+traits$bm_bin[traits$bm_bin == "[2.43586840766667, 3.46818736133333)"] <- "BM_medium"
+traits$bm_bin[traits$bm_bin == "[3.46818736133333, 4.500506315]"] <- "BM_large"
+
+
+# Generation Length
+traits$GL_bin <- bin_data(traits$GL, bins=3, binType = "explicit")
+traits$GL_bin <- as.character(traits$GL_bin)
+traits$GL_bin[traits$GL_bin == "[0.77815125, 1.06658505866667)"] <- "GL_small"
+traits$GL_bin[traits$GL_bin == "[1.06658505866667, 1.35501886733333)"] <- "GL_medium"
+traits$GL_bin[traits$GL_bin == "[1.35501886733333, 1.643452676]"] <- "GL_large"
+
+
+# Habitat Breadth
+traits$HAB_bin <- bin_data(traits$hab_breadth, bins=3, binType = "explicit")
+traits$HAB_bin <- as.character(traits$HAB_bin)
+traits$HAB_bin[traits$HAB_bin == "[1.414213562, 2.674859849)"] <- "HAB_small"
+traits$HAB_bin[traits$HAB_bin == "[2.674859849, 3.935506136)"] <- "HAB_medium"
+traits$HAB_bin[traits$HAB_bin == "[3.935506136, 5.196152423]"] <- "HAB_large"
+
+
+# Clutch
+traits$CL_bin <- bin_data(traits$clutch, bins=3, binType = "explicit")
+traits$CL_bin <- as.character(traits$CL_bin)
+traits$CL_bin[traits$CL_bin == "[1, 2)"] <- "CL_small"
+traits$CL_bin[traits$CL_bin == "[2, 3)"] <- "CL_medium"
+traits$CL_bin[traits$CL_bin == "[3, 4]"] <- "CL_large"
+```
+
+##______________________________________________________________
+#### *Calculate UTCs*
+##______________________________________________________________
+
+```{r message=FALSE, error=FALSE, warning=FALSE, eval = FALSE}
+
+# for new binned trait data
+UTC <- traits %>% 
+  dplyr::distinct (bm_bin, CL_bin, GL_bin, HAB_bin,  # continuous     
+                   foraging_guild, pelagic_specialist, diet_5cat, migrate) #categorical
+
+# unique trait combinations
+UTC<- UTC %>% dplyr::mutate(group = 1:nrow(.))
+# add an identifying column called group to the dataframe
+
+fg_spp <- dplyr::inner_join(traits, UTC)
+
+# dataframe of number of species per functional unit
+count <- table(fg_spp$group) %>% 
+  # count species per functional unit
+  as.data.frame(., stringsAsFactors = FALSE) %>% 
+  # convert to dataframe
+  dplyr::mutate(Var1 = as.numeric(Var1))
+# convert to numeric to allow join
+
+# join number of species per functional unit to species attributions
+fg_spp <- fg_spp %>% 
+  dplyr::left_join(count, by = c("group" = "Var1")) %>% 
+  # join count to dataframe
+  dplyr::select(binomial, group, count = Freq, everything())
+# reorder columns
+
+# Calculate proportions 
+
+proportion <- select(fg_spp, count) %>% mutate_all(funs(ifelse(.>1, 0, .)))
+fg_spp$proportion <- proportion$count
+
+```
+
+##______________________________________________________________
+#### *Make the UTC plots*
+##______________________________________________________________
+
+```{r message=FALSE, error=FALSE, warning=FALSE, eval = FALSE}
+
+IUCN <- fg_spp %>% group_by(IUCN, proportion) %>% summarise(Freq=n()) # to calculate frequency
+IUCN <- IUCN %>% group_by(IUCN) %>% mutate(Percent = 100*Freq/sum(Freq)) # to calculate percentage
+
+IUCN_UTC <- filter(IUCN, proportion > 0)
+
+IUCN_UTC$IUCN = factor(IUCN_UTC$IUCN, levels=c("CR", "EN", "VU", "NT", "LC"))
+
+library(tidyr)
+# Prepare the text for number of species
+IUCN_UTC$sp <- "n = "
+IUCN_UTC <- IUCN_UTC %>% unite("sp", c(sp, Freq), sep = "")
+
+# Set the position halfway up the bar
+IUCN_UTC$txt <- (IUCN_UTC$Percent)/2
+
+ggplot()+
+  geom_bar(aes(x=IUCN, y=Percent, fill = IUCN), 
+           data = IUCN_UTC, stat="identity", colour="black", 
+           fill=c("dodgerblue","dodgerblue","orange", "orange", "dodgerblue"))+
+    geom_text(aes(y = txt, label = sp, group = IUCN), color = "black", fontface = "bold", size = 5)+
+           theme_bw(base_size = 15) + 
+           theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())+
+           labs(y = "Proportion UTC (%)", x = "IUCN Category")
+
+
+
+ggplot(IUCN_UTC, aes(x=IUCN, y=Percent, fill = IUCN))+
+  geom_bar(stat="identity", colour="black", 
+           fill=c("dodgerblue","dodgerblue","orange", "orange", "dodgerblue"))+
+    geom_text(aes(y = txt, label = sp, group = IUCN), color = "black", size = 5)+
+           theme_bw(base_size = 15) + 
+           theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())+
+           labs(y = "Percentage UTC (%)", x = "IUCN Category")
+
+
+
+  ggsave("Figure3.pdf", width = 8, height = 8)
+  ggsave("Figure3.png", width = 5, height = 5)
+  
+traits %>% group_by(IUCN) %>% summarise(n = n())
+traits %>% group_by(Threat) %>% summarise(n = n())
+
+```
+
+```{r, echo=FALSE, warning=FALSE}
+library(knitr)
+include_graphics("Figure3.png")
+
+```
+
+Figure 3 Proportion of seabird species with unique trait combinations for each IUCN category. Orange represents non-threatened categories and blue represents globally threatened categories.
+
+
+##______________________________________________________________
+## 8. Importing species threat data from IUCN
+##______________________________________________________________
+
+Note - an API key is needed to download the IUCN data.
+
+IUCN Threat Data were downloaded on July 14th, 2020. Because threats are updated through time, they may change in the future.
+
+```{r message=FALSE, error=FALSE, warning=FALSE, eval = FALSE}
+
+library(rredlist); library(rlist) # Load package
+
+spp <- as.character(traits$binomial) # vector of species names from the traits dataframe
+
+iucn_key <- " " # Enter your unique IUCN code here
+
+
+# Extract the threats for each species from th IUCN database. 
+# NOTE - this code take ~15 minutes to run.
+
+iucn <- lapply(spp, function(x) {
+  y <- rl_threats(name = x, key = iucn_key)
+  Sys.sleep(2)
+  # 2 second delay makes API work better - recommended by IUCN
+  return(y)
+})
+
+### Add an extra column to the dataframes in the list with the binomial names:
+for (i in 1:length(iucn)) { 
+  iucn[[i]][["result"]]$binomial <- iucn[[i]][["name"]] 
+}
+
+iucn <- Reduce(rbind, iucn) ## Reduce the lists down
+iucn[1:338] <- NULL # remove all of the extra species names in the list
+
+# Create an alternative dataframe for species with no threats (n = 36)
+no_threats <- iucn[sapply(iucn, length)<2]
+no_threats <- list.rbind(no_threats) # binds all list elements by row to make a dataframe
+no_threats <- list.rbind(no_threats) # run twice
+colnames(no_threats) <- "binomial"
+no_threats <- as.data.frame(no_threats)
+no_threats$binomial <- as.character(no_threats$binomial)
+no_threats$code <- as.character(0)
+no_threats$title <- "No threats to population"
+
+
+# Remove all lists with species with no threats
+iucn <- iucn[sapply(iucn, length)>1] 
+# binds all list elements by row to make a dataframe
+iucn <- list.rbind(iucn) 
+
+# Delete the columns that will not be used in further analyses
+iucn <- iucn[- c(3:7)] 
+
+# match the no threats dataframe with the iucn dataframe
+IUCN_threats <- rbind(iucn, no_threats)
+
+# Rename threats to their general threats 
+IUCN_threats$Threat_Class <- as.character(IUCN_threats$code) #make new column
+IUCN_threats$Threat_Class[startsWith(IUCN_threats$Threat_Class, "0")] <- "No threats"
+IUCN_threats$Threat_Class[startsWith(IUCN_threats$Threat_Class, "1.")] <- "Residential & commercial development"
+IUCN_threats$Threat_Class[startsWith(IUCN_threats$Threat_Class, "2.")] <- "Agriculture & aquaculture"
+IUCN_threats$Threat_Class[startsWith(IUCN_threats$Threat_Class, "3.")] <- "Energy production & mining"
+IUCN_threats$Threat_Class[startsWith(IUCN_threats$Threat_Class, "4.")] <- "Transportation & service corridors"
+IUCN_threats$Threat_Class[startsWith(IUCN_threats$Threat_Class, "5.")] <- "Biological resource use"
+IUCN_threats$Threat_Class[startsWith(IUCN_threats$Threat_Class, "6.")] <- "Human intrusions & disturbance"
+IUCN_threats$Threat_Class[startsWith(IUCN_threats$Threat_Class, "7.")] <- "Natural system modifications"
+IUCN_threats$Threat_Class[startsWith(IUCN_threats$Threat_Class, "8.")] <- "Invasive & native species, genes & diseases"
+IUCN_threats$Threat_Class[startsWith(IUCN_threats$Threat_Class, "9.")] <- "Pollution"
+IUCN_threats$Threat_Class[startsWith(IUCN_threats$Threat_Class, "10.")] <- "Geological events"
+IUCN_threats$Threat_Class[startsWith(IUCN_threats$Threat_Class, "11.")] <- "Climate change & severe weather"
+IUCN_threats$Threat_Class[startsWith(IUCN_threats$Threat_Class, "12.")] <- "Other"
+
+
+# reclassify threats into habitat, direct, no threats and other
+
+IUCN_threats$reclass <- as.character(IUCN_threats$Threat_Class) #assign a new column
+IUCN_threats$reclass[startsWith(IUCN_threats$reclass, "Residential")] <- "Habitat"
+IUCN_threats$reclass[startsWith(IUCN_threats$reclass, "Agri")] <- "Habitat"
+IUCN_threats$reclass[startsWith(IUCN_threats$reclass, "Energy")] <- "Habitat"
+IUCN_threats$reclass[startsWith(IUCN_threats$reclass, "Trans")] <- "Habitat"
+IUCN_threats$reclass[startsWith(IUCN_threats$reclass, "Natural")] <- "Habitat"
+IUCN_threats$reclass[startsWith(IUCN_threats$reclass, "Pollu")] <- "Habitat"
+
+IUCN_threats$reclass[startsWith(IUCN_threats$reclass, "Biolog")] <- "Direct"
+IUCN_threats$reclass[startsWith(IUCN_threats$reclass, "Invas")] <- "Direct"
+IUCN_threats$reclass[startsWith(IUCN_threats$reclass, "Human")] <- "Direct"
+
+IUCN_threats$reclass[startsWith(IUCN_threats$reclass, "Geo")] <- "Other"
+
+IUCN_threats$reclass[startsWith(IUCN_threats$Threat_Class, "Climate")] <- "Climate"
+
+```
+
+##______________________________________________________________
+## 9. SIMPER Analysis
+##______________________________________________________________
+
+```{r message=FALSE, error=FALSE, warning=FALSE, eval = FALSE}
+
+library(vegan); library(reshape2) # Load packages
+
+# Join the IUCN_threats and traits dataframes
+threats_simper<- left_join(IUCN_threats, traits, by = "binomial") 
+
+# Remove duplictes of threats leaving only one threat class per species
+threats_simper<- threats_simper[!duplicated(threats_simper[,c('binomial', 'Threat_Class')]),] 
+
+# Remove any species at risk from climate or geological threats. These will not be used in further analyses.
+threats_simper<- threats_simper[!grepl("Other", threats_simper$reclass),]
+
+
+# To run the traits through the SIMPER analysis in R, all traits must be class = character. We therefore change all traits to characters. Some will need to be renamed because numbers are not valid. 
+
+# Classify class = character for all categorical traits
+threats_simper$foraging_guild<- as.character(threats_simper$foraging_guild) 
+threats_simper$diet_5cat<- as.character(threats_simper$diet_5cat)
+threats_simper$migrate<- as.character(threats_simper$migrate) 
+threats_simper$pelagic_specialist<- as.character(threats_simper$pelagic_specialist) 
+
+
+# Create a matrix of binned traits
+simper_matrix<- dcast(threats_simper, 
+                      Threat_Class~c(bm_bin, GL_bin, CL_bin, HAB_bin, # continous traits
+                                     migrate, pelagic_specialist, diet_5cat, foraging_guild), # categorical traits 
+                      length)
+
+# Assign "Threat_Class" as the rownames for simper_matrix 
+rownames(simper_matrix) <- simper_matrix$Threat_Class
+# Delete the column "Threat_Class"
+simper_matrix$Threat_Class<- NULL
+
+
+# Calculate the proportion of traits
+simper_proportions<- simper_matrix # create a copy of the dataframe
+
+simper_proportions<- simper_proportions %>%
+  rowwise() %>%
+  mutate(total = sum(BM_large +BM_medium + BM_small), 
+         BM_large = (BM_large / total)*100, 
+         BM_medium = (BM_medium / total)*100, 
+         BM_small = (BM_small / total)*100)
+
+simper_proportions<- simper_proportions %>%
+  rowwise() %>%
+  mutate(total = sum(CL_large +CL_medium + CL_small), 
+         CL_large = (CL_large / total)*100, 
+         CL_medium = (CL_medium / total)*100, 
+         CL_small = (CL_small / total)*100)
+
+simper_proportions<- simper_proportions %>%
+  rowwise() %>%
+  mutate(total = sum(GL_large +GL_medium + GL_small), 
+         GL_large = (GL_large / total)*100, 
+         GL_medium = (GL_medium / total)*100, 
+         GL_small = (GL_small / total)*100)
+
+simper_proportions<- simper_proportions %>%
+  rowwise() %>%
+  mutate(total = sum(HAB_large +HAB_medium + HAB_small), 
+         HAB_large = (HAB_large / total)*100, 
+         HAB_medium = (HAB_medium / total)*100, 
+         HAB_small = (HAB_small / total)*100)
+
+simper_proportions<- simper_proportions %>%
+  rowwise() %>%
+  mutate(total = sum(FM +NM), 
+         FM = (FM / total)*100, 
+         NM = (NM / total)*100)
+
+
+simper_proportions<- simper_proportions %>%
+  rowwise() %>%
+  mutate(total = sum(`Non-pelagic Specialist`, `Pelagic Specialist`), 
+         `Non-pelagic Specialist` = (`Non-pelagic Specialist` / total)*100, 
+         `Pelagic Specialist` = (`Pelagic Specialist` / total)*100)
+
+
+simper_proportions<- simper_proportions %>%
+  rowwise() %>%
+  mutate(total = sum(Diver +Generalist + Ground + Surface), 
+         Diver = (Diver / total)*100, 
+         Generalist = (Generalist / total)*100, 
+         Ground = (Ground / total)*100, 
+         Surface = (Surface / total)*100)
+
+
+simper_proportions<- simper_proportions %>%
+  rowwise() %>%
+  mutate(total = sum(Omnivore + Invertebrates + `Fish and Carrion`), 
+         Omnivore = (Omnivore / total)*100, 
+         Invertebrates = (Invertebrates / total)*100, 
+         `Fish and Carrion` = (`Fish and Carrion` / total)*100)
+
+
+simper_proportions$total <- NULL
+rownames(simper_proportions) <- rownames(simper_matrix)
+
+# Simplify threat meta data for the SIMPER computation
+threats_meta<- threats_simper[!duplicated(threats_simper[,c('Threat_Class', 'reclass')]),]
+
+# Compute SIMPER
+simper_sb_proportions <- with(threats_meta, simper(simper_proportions, reclass))
+summary(simper_sb_proportions) 
+
+```
+
+##______________________________________________________________
+#### *SIMPER Table*
+##______________________________________________________________
+
+
+```{r, eval = FALSE}
+
+table <- summary(simper_sb_proportions) 
+
+# Make a table
+
+## HABITAT VS. DIRECT
+dir_hab<- as.data.frame(table[["Direct_Habitat"]])
+dir_hab$Threat_Contrast <- "Direct vs. Habitat"
+dir_hab$cumsum <- (dir_hab$cumsum)*100
+dir_hab$Trait <- rownames(dir_hab)
+
+#calculate the individual contribution
+dir_hab <- dir_hab %>%
+  mutate(Contribution = cumsum - lag(cumsum, default = first(cumsum)))
+
+dir_hab[1, 9] = dir_hab[1, 6]
+
+# drop column
+dir_hab <- dir_hab %>% select(6:9)
+dir_hab <- dir_hab[1:8,]
+
+
+## DIRECT VS. NO THREAT
+dir_nothr <- as.data.frame(table[["Direct_No threats"]])
+dir_nothr$Threat_Contrast <- "Direct vs. No Threats"
+dir_nothr$cumsum <- (dir_nothr$cumsum)*100
+dir_nothr$Trait <- rownames(dir_nothr)
+
+#calculate the individual contribution
+dir_nothr <- dir_nothr %>%
+  mutate(Contribution = cumsum - lag(cumsum, default = first(cumsum)))
+
+dir_nothr[1, 9] = dir_nothr[1, 6]
+
+# drop column
+dir_nothr <- dir_nothr %>% select(6:9)
+dir_nothr <- dir_nothr[1:8,]
+
+
+## HABITAT VS. NO THREAT
+hab_nothr <- as.data.frame(table[["Habitat_No threats"]])
+hab_nothr$Threat_Contrast <- "Habitat vs. No Threats"
+
+hab_nothr$cumsum <- (hab_nothr$cumsum)*100
+hab_nothr$Trait <- rownames(hab_nothr)
+
+#calculate the individual contribution
+hab_nothr <- hab_nothr %>%
+  mutate(Contribution = cumsum - lag(cumsum, default = first(cumsum)))
+
+hab_nothr[1, 9] = hab_nothr[1, 6]
+
+# drop column
+hab_nothr <- hab_nothr %>% select(6:9)
+
+hab_nothr <- hab_nothr[1:8,]
+
+
+## CLIMATE VS DIRECT
+
+clim_dir <- as.data.frame(table[["Climate_Direct"]])
+clim_dir$Threat_Contrast <- "Climate Change vs. Direct"
+clim_dir$cumsum <- (clim_dir$cumsum)*100
+clim_dir$Trait <- rownames(clim_dir)
+
+#calculate the individual contribution
+clim_dir <- clim_dir %>%
+  mutate(Contribution = cumsum - lag(cumsum, default = first(cumsum)))
+
+clim_dir[1, 9] = clim_dir[1, 6]
+
+# drop column
+clim_dir <- clim_dir %>% select(6:9)
+clim_dir <- clim_dir[1:8,]
+
+
+
+## CLIMATE VS HABITAT
+
+clim_hab <- as.data.frame(table[["Climate_Habitat"]])
+clim_hab$Threat_Contrast <- "Climate Change vs. Habitat"
+clim_hab$cumsum <- (clim_hab$cumsum)*100
+clim_hab$Trait <- rownames(clim_hab)
+
+#calculate the individual contribution
+clim_hab <- clim_hab %>%
+  mutate(Contribution = cumsum - lag(cumsum, default = first(cumsum)))
+
+clim_hab[1, 9] = clim_hab[1, 6]
+
+# drop column
+clim_hab <- clim_hab %>% select(6:9)
+clim_hab <- clim_hab[1:8,]
+
+
+
+## CLIMATE VS NO THREAT
+
+clim_nothr <- as.data.frame(table[["Climate_No threats"]])
+clim_nothr$Threat_Contrast <- "Climate Change vs. No Threat"
+clim_nothr$cumsum <- (clim_nothr$cumsum)*100
+clim_nothr$Trait <- rownames(clim_nothr)
+
+#calculate the individual contribution
+clim_nothr <- clim_nothr %>%
+  mutate(Contribution = cumsum - lag(cumsum, default = first(cumsum)))
+
+clim_nothr[1, 9] = clim_nothr[1, 6]
+
+# drop column
+clim_nothr <- clim_nothr %>% select(6:9)
+clim_nothr <- clim_nothr[1:8,]
+
+
+
+# BIND TOGETHER
+table2 <- rbind(clim_dir, clim_hab, clim_nothr, dir_hab, dir_nothr, hab_nothr)
+
+table2 <- table2 %>% select(Threat_Contrast, Trait, Contribution, cumsum)
+
+
+# Organise the simper_proportions matrix to find the directionality
+
+simper_proportions$reclass <- c("Habitat", "Direct", "Climate", "Habitat", "Direct", "Direct", "Habitat", "No Threats", "Habitat","Habitat","Habitat")
+
+
+prop <-  simper_proportions %>% group_by(reclass) %>% summarise_if(is.numeric, median) 
+
+table2$`Climate Change` <-  c("-","+","+","-","+","=","+","-",
+                              "+","+","-","-","=","=","+","-",
+                              "-","+","-","+","+","+","-","+",
+                              "","","","","","","","",
+                              "","","","","","","","",
+                              "","","","","","","","")
+
+
+table2$Direct <-  c("+","-","-","+","-","=","-","+",
+                    "","","","","","","","",
+                    "","","","","","","","",
+                    "-","+","-","+","-","-","+","-",
+                    "+","-","+","+","-","+","+","-", 
+                    "","","","","","","","")
+
+table2$Habitat <- c("","","","","","","","",
+                    "-","-","+","+","=","=","-","+",
+                    "","","","","","","","",
+                    "+","-","+","-","+","+","-","+",
+                    "","","","","","","","",
+                    "+","-","+","-","+","-","+","+")
+
+table2$`No Threat` <- c("","","","","","","","",
+                        "","","","","","","","",
+                        "+","-","+","-","-","-","+","-",
+                        "","","","","","","","",
+                        "-","+","-","-","+","-","-","+",
+                        "-","+","-","+","-","+","-","-")
+
+
+write.csv(table2, "SIMPER_output_final_OCT9TH.csv")
+
+```
+
+
