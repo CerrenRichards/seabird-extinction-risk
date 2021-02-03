@@ -1,16 +1,14 @@
 # Seabird Extinction Risk Code
 
-This repository contains the data and R code required to replicate the analyses in **Richards, C., Cooke, R.S.C. & Bates, A.E. - Biological traits of seabirds predict extinction risk and vulnerability to anthropogenic threats.**
+This repository contains the data and R code required to replicate the analyses in **Richards, C., Cooke, R.S.C. & Bates, A.E. (2021) Biological traits of seabirds predict extinction risk and vulnerability to anthropogenic threats. Global Ecology and Biogeography.**
 
 
 ## Scripts
-`seabird-extinction-risk.Rmd` The R Markdown file that contains the code for the analysis.
+`seabird-extinction-risk.Rmd` The R Markdown file that summarises the major analytical steps.
 
 
 ## Data
-`281_sb_traits.csv` Non-imputed trait data for 281 seabird species.
-
-`341_sb_traits.csv` Imputed and averaged trait dataset for 341 seabird species.
+The raw non-imputed trait data `Non-imputed Trait Data.csv` and complete imputed trait data `Imputed Trait Data.csv` used for all analyses are available for download on Dryad: https://doi.org/10.5061/dryad.x69p8czhd. 
 
 
 ### Contact
