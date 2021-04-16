@@ -1,6 +1,6 @@
 # Seabird Extinction Risk Code
 
-This repository contains the data and R code required to replicate the analyses in **Richards, C., Cooke, R.S.C. & Bates, A.E. (2021) Biological traits of seabirds predict extinction risk and vulnerability to anthropogenic threats. Global Ecology and Biogeography.**
+This repository contains the data and R code required to replicate the analyses in **Richards, C., Cooke, R.S.C. & Bates, A.E. (2021) Biological traits of seabirds predict extinction risk and vulnerability to anthropogenic threats. Global Ecology and Biogeography, 30, 973-986. https://doi.org/10.1111/geb.13279**
 
 
 ## Scripts
